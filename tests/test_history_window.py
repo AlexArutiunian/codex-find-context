@@ -1,6 +1,12 @@
 from types import SimpleNamespace
 
-from codex_context.app import MESSAGE_WINDOW, _render_messages, _window_max_first, _window_start
+from codex_context.app import (
+    MESSAGE_WINDOW,
+    _first_message_for_snippet,
+    _render_messages,
+    _window_max_first,
+    _window_start,
+)
 
 
 def make_messages(count: int):
@@ -37,3 +43,19 @@ def test_render_messages_limits_html_to_one_window():
     assert f"message-{MESSAGE_WINDOW + 1}" not in html
     assert "#1" in html
     assert f"#{MESSAGE_WINDOW}" in html
+
+
+def test_search_snippet_opens_window_around_source_message():
+    messages = make_messages(1200)
+    messages[699] = SimpleNamespace(
+        role="assistant",
+        text="Сначала проверили RealSense.\nПотом починили depth align на 640x480.",
+    )
+
+    first_message = _first_message_for_snippet(
+        messages,
+        "Сначала проверили RealSense. Потом починили depth align на 640x480.",
+    )
+
+    assert first_message is not None
+    assert first_message <= 700 <= first_message + MESSAGE_WINDOW - 1
