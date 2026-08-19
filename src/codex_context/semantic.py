@@ -23,20 +23,25 @@ class SemanticSearch:
         self.model_name = model_name
         self.cache_dir = cache_dir
         self._model = None
-        self._lock = threading.Lock()
+        self._model_lock = threading.Lock()
+        self._index_lock = threading.Lock()
+        self._inference_lock = threading.Lock()
 
     def _load_model(self):
         if self._model is not None:
             return self._model
-        from fastembed import TextEmbedding
+        with self._model_lock:
+            if self._model is not None:
+                return self._model
+            from fastembed import TextEmbedding
 
-        try:
-            self._model = TextEmbedding(
-                model_name=self.model_name,
-                cache_dir=str(self.cache_dir),
-            )
-        except TypeError:
-            self._model = TextEmbedding(model_name=self.model_name)
+            try:
+                self._model = TextEmbedding(
+                    model_name=self.model_name,
+                    cache_dir=str(self.cache_dir),
+                )
+            except TypeError:
+                self._model = TextEmbedding(model_name=self.model_name)
         return self._model
 
     def _prepare(self, text: str, kind: str) -> str:
@@ -53,8 +58,8 @@ class SemanticSearch:
         return array
 
     def ensure_embeddings(self) -> tuple[int, int]:
-        """Build missing embeddings without materializing the whole corpus in RAM."""
-        with self._lock:
+        """Build missing embeddings in small batches without blocking search for the whole run."""
+        with self._index_lock:
             model = self._load_model()
             batch_size = 64
 
@@ -67,7 +72,11 @@ class SemanticSearch:
                     break
 
                 texts = [self._prepare(text, "passage") for _, text in pending]
-                vectors = model.embed(texts, batch_size=batch_size)
+                # Hold the inference lock only for one small batch. Search requests can
+                # run between batches instead of waiting for the entire corpus index.
+                with self._inference_lock:
+                    vectors = list(model.embed(texts, batch_size=batch_size))
+
                 serialized: list[tuple[int, bytes]] = []
                 for (chunk_id, _), vector in zip(pending, vectors, strict=True):
                     normalized = self._normalized(vector)
@@ -77,14 +86,20 @@ class SemanticSearch:
             return self.store.chunk_counts(self.model_name)
 
     def semantic_search(self, query: str, limit: int = 10) -> list[SearchHit]:
+        """Search only embeddings that are already available.
+
+        Missing embeddings continue to be produced by the background indexer. A
+        user search must never synchronously finish the whole corpus first.
+        """
         query = query.strip()
         if not query:
             return []
-        self.ensure_embeddings()
+
         model = self._load_model()
-        query_vector = self._normalized(
-            next(iter(model.embed([self._prepare(query, "query")], batch_size=1)))
-        )
+        with self._inference_lock:
+            query_vector = self._normalized(
+                next(iter(model.embed([self._prepare(query, "query")], batch_size=1)))
+            )
 
         heap: list[tuple[float, int, SearchHit]] = []
         serial = 0
@@ -110,9 +125,21 @@ class SemanticSearch:
         return [item[2] for item in sorted(heap, reverse=True)]
 
     def search(self, query: str, limit: int = 10) -> SearchResult:
+        total, embedded = self.store.chunk_counts(self.model_name)
+        if embedded == 0:
+            hits = self.store.lexical_search(query, limit)
+            return SearchResult(
+                hits=hits,
+                mode="lexical fallback",
+                detail=f"semantic index ещё прогревается: {embedded}/{total} chunks",
+            )
+
         try:
             hits = self.semantic_search(query, limit)
-            return SearchResult(hits=hits, mode="semantic")
+            detail = None
+            if embedded < total:
+                detail = f"поиск по уже готовым {embedded}/{total} semantic chunks"
+            return SearchResult(hits=hits, mode="semantic", detail=detail)
         except Exception as exc:
             hits = self.store.lexical_search(query, limit)
             return SearchResult(hits=hits, mode="lexical fallback", detail=str(exc))
