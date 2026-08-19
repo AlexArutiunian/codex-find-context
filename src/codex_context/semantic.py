@@ -160,8 +160,13 @@ class SemanticSearch:
 
             return self.store.chunk_counts(self.model_name)
 
-    def semantic_search(self, query: str, limit: int = 10) -> list[SearchHit]:
-        """Search only embeddings that are already available."""
+    def semantic_search(
+        self,
+        query: str,
+        limit: int = 10,
+        session_id: str | None = None,
+    ) -> list[SearchHit]:
+        """Search only embeddings that are already available, optionally in one chat."""
         query = query.strip()
         if not query:
             return []
@@ -173,7 +178,7 @@ class SemanticSearch:
 
         heap: list[tuple[float, int, SearchHit]] = []
         serial = 0
-        for row in self.store.iter_embeddings(self.model_name):
+        for row in self.store.iter_embeddings(self.model_name, session_id=session_id):
             vector = np.frombuffer(row["embedding"], dtype=np.float32)
             if vector.shape != query_vector.shape:
                 continue
@@ -194,22 +199,35 @@ class SemanticSearch:
 
         return [item[2] for item in sorted(heap, reverse=True)]
 
-    def search(self, query: str, limit: int = 10) -> SearchResult:
-        total, embedded = self.store.chunk_counts(self.model_name)
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        session_id: str | None = None,
+    ) -> SearchResult:
+        total, embedded = self.store.chunk_counts(self.model_name, session_id=session_id)
+        scope_suffix = " этого чата" if session_id is not None else ""
         if embedded == 0:
-            hits = self.store.lexical_search(query, limit)
+            hits = self.store.lexical_search(query, limit, session_id=session_id)
             return SearchResult(
                 hits=hits,
                 mode="lexical fallback",
-                detail=f"semantic index ещё прогревается: {embedded}/{total} chunks",
+                detail=(
+                    f"semantic index{scope_suffix} ещё прогревается: "
+                    f"{embedded}/{total} chunks"
+                ),
             )
 
         try:
-            hits = self.semantic_search(query, limit)
+            hits = self.semantic_search(query, limit, session_id=session_id)
             detail = None
             if embedded < total:
-                detail = f"поиск по уже готовым {embedded}/{total} semantic chunks"
+                detail = (
+                    f"поиск по уже готовым {embedded}/{total} semantic chunks{scope_suffix}"
+                )
+            elif session_id is not None:
+                detail = f"поиск только внутри выбранного чата: {embedded} semantic chunks"
             return SearchResult(hits=hits, mode="semantic", detail=detail)
         except Exception as exc:
-            hits = self.store.lexical_search(query, limit)
+            hits = self.store.lexical_search(query, limit, session_id=session_id)
             return SearchResult(hits=hits, mode="lexical fallback", detail=str(exc))
