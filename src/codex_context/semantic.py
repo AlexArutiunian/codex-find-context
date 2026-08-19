@@ -57,8 +57,63 @@ class SemanticSearch:
             array = array / norm
         return array
 
+    def _embed(self, model, texts: list[str], batch_size: int) -> list[np.ndarray]:
+        with self._inference_lock:
+            return list(model.embed(texts, batch_size=batch_size))
+
+    def _save_batch_resilient(self, model, pending: list[tuple[int, str]]) -> None:
+        """Embed one batch, isolating a bad text instead of killing the whole indexer."""
+        texts = [self._prepare(text, "passage") for _, text in pending]
+        try:
+            vectors = self._embed(model, texts, batch_size=len(texts))
+            if len(vectors) != len(pending):
+                raise RuntimeError(
+                    f"embedding model returned {len(vectors)} vectors for {len(pending)} texts"
+                )
+            serialized = [
+                (chunk_id, self._normalized(vector).tobytes())
+                for (chunk_id, _), vector in zip(pending, vectors, strict=True)
+            ]
+            self.store.save_embeddings(self.model_name, serialized)
+            return
+        except Exception as batch_exc:
+            print(
+                "[codex-context] embedding batch failed; retrying chunks one-by-one: "
+                f"{batch_exc}"
+            )
+
+        serialized: list[tuple[int, bytes]] = []
+        failures: list[tuple[int, str]] = []
+        successes = 0
+        for chunk_id, text in pending:
+            try:
+                vector = self._embed(
+                    model,
+                    [self._prepare(text, "passage")],
+                    batch_size=1,
+                )[0]
+                serialized.append((chunk_id, self._normalized(vector).tobytes()))
+                successes += 1
+            except Exception as exc:
+                # Empty BLOB is an explicit local marker: this chunk was processed but
+                # cannot be embedded. Search ignores it because its vector shape is 0.
+                serialized.append((chunk_id, b""))
+                failures.append((chunk_id, str(exc)))
+
+        # If absolutely everything failed, this is probably a model/runtime problem,
+        # not 64 independently malformed messages. Retry later instead of marking the
+        # whole corpus as bad.
+        if successes == 0:
+            raise RuntimeError(
+                "embedding runtime failed for the whole batch and for every single-item retry"
+            ) from batch_exc
+
+        self.store.save_embeddings(self.model_name, serialized)
+        for chunk_id, error in failures:
+            print(f"[codex-context] skipped unembeddable chunk {chunk_id}: {error}")
+
     def ensure_embeddings(self) -> tuple[int, int]:
-        """Build missing embeddings in small batches without blocking search for the whole run."""
+        """Build missing embeddings in bounded batches without blocking user search."""
         with self._index_lock:
             model = self._load_model()
             batch_size = 64
@@ -71,17 +126,7 @@ class SemanticSearch:
                 if not pending:
                     break
 
-                texts = [self._prepare(text, "passage") for _, text in pending]
-                # Hold the inference lock only for one small batch. Search requests can
-                # run between batches instead of waiting for the entire corpus index.
-                with self._inference_lock:
-                    vectors = list(model.embed(texts, batch_size=batch_size))
-
-                serialized: list[tuple[int, bytes]] = []
-                for (chunk_id, _), vector in zip(pending, vectors, strict=True):
-                    normalized = self._normalized(vector)
-                    serialized.append((chunk_id, normalized.tobytes()))
-                self.store.save_embeddings(self.model_name, serialized)
+                self._save_batch_resilient(model, pending)
 
             return self.store.chunk_counts(self.model_name)
 
@@ -89,17 +134,16 @@ class SemanticSearch:
         """Search only embeddings that are already available.
 
         Missing embeddings continue to be produced by the background indexer. A
-        user search must never synchronously finish the whole corpus first.
+        user search never synchronously finishes the whole corpus first.
         """
         query = query.strip()
         if not query:
             return []
 
         model = self._load_model()
-        with self._inference_lock:
-            query_vector = self._normalized(
-                next(iter(model.embed([self._prepare(query, "query")], batch_size=1)))
-            )
+        query_vector = self._normalized(
+            self._embed(model, [self._prepare(query, "query")], batch_size=1)[0]
+        )
 
         heap: list[tuple[float, int, SearchHit]] = []
         serial = 0
