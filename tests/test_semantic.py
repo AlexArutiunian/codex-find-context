@@ -26,6 +26,21 @@ class FakeSemanticSearch(SemanticSearch):
         return self._model
 
 
+class FailingChunkEmbeddingModel(FakeEmbeddingModel):
+    def embed(self, texts, batch_size=None):
+        texts = list(texts)
+        if any("BROKEN_EMBEDDING_CHUNK" in text for text in texts):
+            raise RuntimeError("synthetic bad chunk")
+        yield from super().embed(texts, batch_size=batch_size)
+
+
+class FailingChunkSemanticSearch(SemanticSearch):
+    def _load_model(self):
+        if self._model is None:
+            self._model = FailingChunkEmbeddingModel()
+        return self._model
+
+
 def write_session(path: Path, session_id: str, text: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     records = [
@@ -83,3 +98,32 @@ def test_user_search_does_not_finish_partial_index(tmp_path):
     assert after[1] < after[0]
     assert result.mode == "semantic"
     assert result.detail is not None
+
+
+def test_bad_chunk_does_not_stop_remaining_index(tmp_path):
+    codex_home = tmp_path / ".codex"
+    write_session(
+        codex_home / "sessions/2026/08/19/rollout-a-11111111-1111-1111-1111-111111111111.jsonl",
+        "11111111-1111-1111-1111-111111111111",
+        "Чинил RealSense depth камеры",
+    )
+    write_session(
+        codex_home / "sessions/2026/08/19/rollout-b-22222222-2222-2222-2222-222222222222.jsonl",
+        "22222222-2222-2222-2222-222222222222",
+        "BROKEN_EMBEDDING_CHUNK",
+    )
+    write_session(
+        codex_home / "sessions/2026/08/19/rollout-c-33333333-3333-3333-3333-333333333333.jsonl",
+        "33333333-3333-3333-3333-333333333333",
+        "Создавал git branch и worktree",
+    )
+    store = Store(tmp_path / "data/index.sqlite3", codex_home)
+    store.sync_sessions()
+    search = FailingChunkSemanticSearch(store, "fake-model", tmp_path / "models")
+
+    total, processed = search.ensure_embeddings()
+
+    assert processed == total
+    assert store.chunks_needing_embeddings("fake-model", limit=10) == []
+    hits = search.semantic_search("git branch", limit=3)
+    assert any(hit.session_id == "33333333-3333-3333-3333-333333333333" for hit in hits)
