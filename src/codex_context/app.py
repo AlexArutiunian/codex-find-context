@@ -19,23 +19,50 @@ MESSAGE_STEP = 400
 ALL_SEARCH_SCOPE = "__all__"
 
 CSS = """
+html, body {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden;
+}
 .gradio-container {
     max-width: none !important;
     width: 100% !important;
     margin: 0 !important;
     padding: 18px clamp(14px, 2vw, 36px) 30px !important;
+    overflow-x: hidden;
 }
+.gradio-container * { box-sizing: border-box; }
 #hero { margin-bottom: .35rem; }
 #hero h1 { font-size: clamp(1.75rem, 2.3vw, 2.35rem); margin-bottom: .12rem; }
 #hero p { opacity: .75; margin-top: 0; }
+
+.responsive-row,
+.history-controls {
+    width: 100%;
+    min-width: 0;
+}
+.responsive-row > *,
+.history-controls > * {
+    min-width: 0 !important;
+}
+.gradio-container button {
+    min-height: 42px;
+    touch-action: manipulation;
+}
+
 .session-shell {
+    width: 100%;
     height: min(68vh, 780px);
     min-height: 480px;
     overflow-y: auto;
+    overflow-x: hidden;
     padding: 10px 4px;
     scrollbar-gutter: stable;
+    overscroll-behavior: contain;
 }
 .msg {
+    width: 100%;
+    max-width: 100%;
     border: 1px solid var(--border-color-primary);
     border-radius: 14px;
     padding: 12px 14px;
@@ -56,9 +83,112 @@ CSS = """
     line-height: 1.5;
 }
 .small-note { opacity: .72; font-size: 13px; }
-@media (max-width: 900px) {
-    .gradio-container { padding-left: 10px !important; padding-right: 10px !important; }
-    .session-shell { min-height: 420px; height: 62vh; }
+
+#search-results {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+}
+#search-results table { min-width: 760px; }
+
+@media (max-width: 1100px) {
+    .gradio-container {
+        padding-left: 16px !important;
+        padding-right: 16px !important;
+    }
+    .responsive-row {
+        flex-wrap: wrap !important;
+        gap: 10px !important;
+    }
+    .responsive-row > * {
+        flex: 1 1 320px !important;
+    }
+    .history-controls {
+        flex-wrap: wrap !important;
+        gap: 8px !important;
+    }
+    .history-controls > :nth-child(3) {
+        order: -1;
+        flex: 1 1 100% !important;
+        width: 100% !important;
+    }
+    .history-controls > :not(:nth-child(3)) {
+        flex: 1 1 140px !important;
+    }
+    .session-shell { min-height: 430px; height: 64vh; }
+}
+
+@media (max-width: 720px) {
+    .gradio-container {
+        padding: 10px 9px 22px !important;
+    }
+    #hero h1 { font-size: 1.65rem; }
+    #hero p { font-size: .92rem; }
+
+    .responsive-row {
+        flex-direction: column !important;
+        flex-wrap: nowrap !important;
+        gap: 8px !important;
+    }
+    .responsive-row > * {
+        width: 100% !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
+        flex: 1 1 auto !important;
+    }
+    .title-actions-row > :not(:first-child),
+    .search-scope-row > :last-child {
+        width: 100% !important;
+    }
+
+    .history-controls {
+        display: grid !important;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) !important;
+        gap: 8px !important;
+        align-items: stretch !important;
+    }
+    .history-controls > * {
+        width: 100% !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
+        margin: 0 !important;
+    }
+    .history-controls > :nth-child(3) {
+        grid-column: 1 / -1;
+        grid-row: 1;
+        order: initial;
+    }
+
+    .session-shell {
+        min-height: 360px;
+        height: 62dvh;
+        padding: 5px 1px;
+    }
+    .msg {
+        border-radius: 11px;
+        padding: 10px 11px;
+        margin: 7px 0;
+    }
+    .msg-text { font-size: 12px; line-height: 1.45; }
+    .msg-role { font-size: 11px; }
+
+    .gradio-container input,
+    .gradio-container textarea,
+    .gradio-container select {
+        font-size: 16px !important;
+    }
+    .gradio-container button { min-height: 46px; }
+
+    #search-results table { min-width: 680px; }
+}
+
+@media (max-width: 430px) {
+    .gradio-container { padding-left: 7px !important; padding-right: 7px !important; }
+    #hero h1 { font-size: 1.5rem; }
+    .history-controls { gap: 6px !important; }
+    .session-shell { min-height: 330px; height: 60dvh; }
+    .msg-text { font-size: 11.5px; }
 }
 """
 
@@ -213,9 +343,14 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
             if total
             else "semantic index пока пуст"
         )
+        access_status = (
+            "LAN **включён**"
+            if settings.host in {"0.0.0.0", "::"}
+            else "доступ **только с этого ПК**"
+        )
         return (
             f"**{len(sessions)}** сессий · {semantic_status} · "
-            f"фон: **{settings.embedding_threads} CPU потока** · "
+            f"фон: **{settings.embedding_threads} CPU потока** · {access_status} · "
             f"`CODEX_HOME={settings.codex_home}`"
         )
 
@@ -470,7 +605,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
 
         with gr.Tabs(selected="chats") as main_tabs:
             with gr.Tab("Чаты", id="chats"):
-                with gr.Row():
+                with gr.Row(elem_classes=["responsive-row", "session-picker-row"]):
                     with gr.Column(scale=8):
                         session_selector = gr.Dropdown(
                             choices=initial_choices,
@@ -481,7 +616,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                     with gr.Column(scale=1, min_width=150):
                         refresh_btn = gr.Button("↻ Обновить", variant="secondary")
 
-                with gr.Row():
+                with gr.Row(elem_classes=["responsive-row", "title-actions-row"]):
                     title_box = gr.Textbox(
                         value=initial_title,
                         label="Моё название",
@@ -492,7 +627,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                     reset_title_btn = gr.Button("Сбросить", scale=1)
                 rename_status = gr.Markdown()
 
-                with gr.Row():
+                with gr.Row(elem_classes=["responsive-row", "meta-row"]):
                     with gr.Column(scale=7):
                         meta = gr.Markdown(initial_meta)
                     with gr.Column(scale=3):
@@ -504,7 +639,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                         )
 
                 window_status = gr.Markdown(initial_window_note)
-                with gr.Row():
+                with gr.Row(elem_classes=["history-controls"]):
                     first_btn = gr.Button("⏮ Начало", scale=1)
                     prev_btn = gr.Button("← 400", scale=1)
                     history_slider = gr.Slider(
@@ -526,7 +661,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                     "Опиши не точную фразу, а **что ты тогда делал**. "
                     "Можно искать по всей истории или только внутри одного выбранного чата."
                 )
-                with gr.Row():
+                with gr.Row(elem_classes=["responsive-row", "search-scope-row"]):
                     search_scope = gr.Dropdown(
                         choices=initial_search_choices,
                         value=ALL_SEARCH_SCOPE,
@@ -535,7 +670,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                         scale=8,
                     )
                     current_chat_btn = gr.Button("Текущий чат", variant="secondary", scale=1)
-                with gr.Row():
+                with gr.Row(elem_classes=["responsive-row", "search-controls-row"]):
                     query = gr.Textbox(
                         label="Что ищем внутри выбранной области",
                         placeholder="например: где в этом чате я менял threshold и почему",
@@ -550,6 +685,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                     interactive=False,
                     wrap=True,
                     label="Кликни по строке, чтобы открыть точное место в чате",
+                    elem_id="search-results",
                 )
 
         status_timer.tick(
