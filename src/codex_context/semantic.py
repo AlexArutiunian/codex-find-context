@@ -64,6 +64,7 @@ class SemanticSearch:
     def _save_batch_resilient(self, model, pending: list[tuple[int, str]]) -> None:
         """Embed one batch, isolating a bad text instead of killing the whole indexer."""
         texts = [self._prepare(text, "passage") for _, text in pending]
+        batch_error: Exception | None = None
         try:
             vectors = self._embed(model, texts, batch_size=len(texts))
             if len(vectors) != len(pending):
@@ -76,10 +77,11 @@ class SemanticSearch:
             ]
             self.store.save_embeddings(self.model_name, serialized)
             return
-        except Exception as batch_exc:
+        except Exception as exc:
+            batch_error = exc
             print(
                 "[codex-context] embedding batch failed; retrying chunks one-by-one: "
-                f"{batch_exc}"
+                f"{exc}"
             )
 
         serialized: list[tuple[int, bytes]] = []
@@ -106,7 +108,7 @@ class SemanticSearch:
         if successes == 0:
             raise RuntimeError(
                 "embedding runtime failed for the whole batch and for every single-item retry"
-            ) from batch_exc
+            ) from batch_error
 
         self.store.save_embeddings(self.model_name, serialized)
         for chunk_id, error in failures:
