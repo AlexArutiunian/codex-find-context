@@ -12,6 +12,10 @@ from .semantic import SemanticSearch
 from .store import SessionRow, Store
 
 
+MESSAGE_WINDOW = 400
+MESSAGE_STEP = 400
+
+
 CSS = """
 .gradio-container { max-width: 1480px !important; }
 #hero { margin-bottom: 0.4rem; }
@@ -45,23 +49,38 @@ def _session_label(row: SessionRow) -> str:
     return f"{row.title}  ·  {cwd}  ·  {when}"
 
 
-def _render_messages(messages) -> str:
+def _window_start(total_messages: int, first_message: int | float | None = None) -> int:
+    """Return a zero-based start for a fixed-size message window.
+
+    The UI exposes one-based message numbers. ``None`` means the latest window.
+    """
+    if total_messages <= 0:
+        return 0
+    max_start = max(0, total_messages - MESSAGE_WINDOW)
+    if first_message is None:
+        return max_start
+    requested = max(1, int(round(first_message))) - 1
+    return min(requested, max_start)
+
+
+def _window_max_first(total_messages: int) -> int:
+    return max(1, total_messages - MESSAGE_WINDOW + 1)
+
+
+def _render_messages(messages, start: int = 0) -> str:
     if not messages:
         return '<div class="small-note">В этой сессии не удалось извлечь видимые сообщения.</div>'
+
+    end = min(len(messages), start + MESSAGE_WINDOW)
     blocks: list[str] = ['<div class="session-shell">']
     labels = {"user": "Ты", "assistant": "Codex", "tool": "Tool / command"}
-    for message in messages[-400:]:
+    for index, message in enumerate(messages[start:end], start=start + 1):
         role = message.role if message.role in labels else "tool"
         blocks.append(
             f'<div class="msg msg-{role}">'
-            f'<div class="msg-role">{labels.get(role, role)}</div>'
+            f'<div class="msg-role">{labels.get(role, role)} · #{index}</div>'
             f'<div class="msg-text">{html.escape(message.text)}</div>'
             "</div>"
-        )
-    if len(messages) > 400:
-        blocks.insert(
-            1,
-            f'<div class="small-note">Показаны последние 400 из {len(messages)} сообщений.</div>',
         )
     blocks.append("</div>")
     return "".join(blocks)
@@ -107,13 +126,44 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
             f"`CODEX_HOME={settings.codex_home}`"
         )
 
-    def view_session(session_id: str | None):
+    def render_window(session_id: str | None, first_message: int | float | None = None):
         if not session_id:
-            return "", "Сессии не найдены.", "", ""
-        row = store.get_session(session_id)
+            return (
+                "",
+                gr.update(minimum=1, maximum=1, value=1, interactive=False),
+                "Сессии не найдены.",
+            )
+
         parsed = store.load_parsed_session(session_id)
+        messages = parsed.messages if parsed else ()
+        total = len(messages)
+        start = _window_start(total, first_message)
+        end = min(total, start + MESSAGE_WINDOW)
+        conversation = _render_messages(messages, start)
+        slider = gr.update(
+            minimum=1,
+            maximum=_window_max_first(total),
+            value=start + 1,
+            step=1,
+            interactive=total > MESSAGE_WINDOW,
+        )
+        if total:
+            note = (
+                f"**Показаны сообщения {start + 1}–{end} из {total}.** "
+                f"Окно — до {MESSAGE_WINDOW} сообщений."
+            )
+        else:
+            note = "В этой сессии нет извлечённых сообщений."
+        return conversation, slider, note
+
+    def view_session(session_id: str | None, first_message: int | float | None = None):
+        if not session_id:
+            conversation, slider, window_note = render_window(None)
+            return "", "Сессии не найдены.", conversation, "", slider, window_note
+        row = store.get_session(session_id)
         if row is None:
-            return "", "Сессия не найдена.", "", ""
+            conversation, slider, window_note = render_window(None)
+            return "", "Сессия не найдена.", conversation, "", slider, window_note
         meta = (
             f"**ID:** `{row.session_id}`  \n"
             f"**Проект:** `{row.cwd or '—'}`  \n"
@@ -121,14 +171,14 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
             f"**сообщений:** {row.message_count}  \n"
             f"**Файл:** `{row.path}`"
         )
-        conversation = _render_messages(parsed.messages if parsed else ())
+        conversation, slider, window_note = render_window(session_id, first_message)
         resume = f"codex resume {row.session_id}"
-        return row.title, meta, conversation, resume
+        return row.title, meta, conversation, resume, slider, window_note
 
     def refresh(preferred: str | None):
         sync = store.sync_sessions()
         sessions, choices, value = choices_and_default(preferred)
-        title, meta, conversation, resume = view_session(value)
+        title, meta, conversation, resume, slider, window_note = view_session(value)
         note = (
             f"Обновлено: найдено {sync.discovered}, переиндексировано {sync.reindexed}, "
             f"без изменений {sync.unchanged}, ошибок {sync.failed}."
@@ -140,13 +190,40 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
             meta,
             conversation,
             resume,
+            slider,
+            window_note,
             status_markdown(),
             note,
         )
 
     def on_session_change(session_id: str | None):
-        title, meta, conversation, resume = view_session(session_id)
-        return session_id, title, meta, conversation, resume, ""
+        title, meta, conversation, resume, slider, window_note = view_session(session_id)
+        return session_id, title, meta, conversation, resume, slider, window_note, ""
+
+    def previous_window(session_id: str | None, first_message: int | float):
+        if not session_id:
+            return render_window(None)
+        row = store.get_session(session_id)
+        total = row.message_count if row else 0
+        current_start = _window_start(total, first_message)
+        target_first = max(0, current_start - MESSAGE_STEP) + 1
+        return render_window(session_id, target_first)
+
+    def next_window(session_id: str | None, first_message: int | float):
+        if not session_id:
+            return render_window(None)
+        row = store.get_session(session_id)
+        total = row.message_count if row else 0
+        current_start = _window_start(total, first_message)
+        max_start = max(0, total - MESSAGE_WINDOW)
+        target_first = min(max_start, current_start + MESSAGE_STEP) + 1
+        return render_window(session_id, target_first)
+
+    def first_window(session_id: str | None):
+        return render_window(session_id, 1)
+
+    def last_window(session_id: str | None):
+        return render_window(session_id, None)
 
     def save_title(session_id: str | None, title: str):
         if not session_id:
@@ -186,6 +263,8 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
             state.append({"session_id": hit.session_id})
         if result.mode == "semantic":
             note = f"Нашёл {len(rows)} совпадений локальным semantic search."
+            if result.detail:
+                note += f" {result.detail}."
         else:
             note = (
                 "⚠️ Semantic model сейчас недоступна; показан локальный FTS fallback. "
@@ -195,13 +274,13 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
 
     def open_result(result_state, evt: gr.SelectData):
         if not result_state:
-            return (gr.update(), None, "", "", "", "", "")
+            return (gr.update(), None, "", "", "", "", gr.update(), "", "")
         index = evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index
         try:
             session_id = result_state[int(index)]["session_id"]
         except (IndexError, KeyError, TypeError, ValueError):
-            return (gr.update(), None, "", "", "", "", "")
-        title, meta, conversation, resume = view_session(session_id)
+            return (gr.update(), None, "", "", "", "", gr.update(), "", "")
+        title, meta, conversation, resume, slider, window_note = view_session(session_id)
         return (
             gr.update(value=session_id),
             session_id,
@@ -209,11 +288,24 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
             meta,
             conversation,
             resume,
+            slider,
+            window_note,
             "Открыта найденная сессия — можешь сразу переименовать её сверху.",
         )
 
     sessions, initial_choices, initial_id = choices_and_default()
-    initial_title, initial_meta, initial_conversation, initial_resume = view_session(initial_id)
+    (
+        initial_title,
+        initial_meta,
+        initial_conversation,
+        initial_resume,
+        initial_slider,
+        initial_window_note,
+    ) = view_session(initial_id)
+
+    initial_row = store.get_session(initial_id) if initial_id else None
+    initial_total = initial_row.message_count if initial_row else 0
+    initial_start = _window_start(initial_total)
 
     with gr.Blocks(title="Codex Context") as demo:
         selected_session = gr.State(initial_id)
@@ -260,6 +352,23 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                             label="Продолжить в Codex",
                             interactive=False,
                         )
+
+                window_status = gr.Markdown(initial_window_note)
+                with gr.Row():
+                    first_btn = gr.Button("⏮ Начало", scale=1)
+                    prev_btn = gr.Button("← 400", scale=1)
+                    history_slider = gr.Slider(
+                        minimum=1,
+                        maximum=_window_max_first(initial_total),
+                        value=initial_start + 1,
+                        step=1,
+                        label="Первое сообщение в окне",
+                        interactive=initial_total > MESSAGE_WINDOW,
+                        scale=7,
+                    )
+                    next_btn = gr.Button("400 →", scale=1)
+                    last_btn = gr.Button("Конец ⏭", scale=1)
+
                 conversation = gr.HTML(initial_conversation)
 
             with gr.Tab("Поиск по смыслу"):
@@ -294,6 +403,8 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                 meta,
                 conversation,
                 resume_cmd,
+                history_slider,
+                window_status,
                 status,
                 rename_status,
             ],
@@ -301,7 +412,41 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
         session_selector.change(
             on_session_change,
             inputs=[session_selector],
-            outputs=[selected_session, title_box, meta, conversation, resume_cmd, rename_status],
+            outputs=[
+                selected_session,
+                title_box,
+                meta,
+                conversation,
+                resume_cmd,
+                history_slider,
+                window_status,
+                rename_status,
+            ],
+        )
+        history_slider.release(
+            render_window,
+            inputs=[selected_session, history_slider],
+            outputs=[conversation, history_slider, window_status],
+        )
+        first_btn.click(
+            first_window,
+            inputs=[selected_session],
+            outputs=[conversation, history_slider, window_status],
+        )
+        prev_btn.click(
+            previous_window,
+            inputs=[selected_session, history_slider],
+            outputs=[conversation, history_slider, window_status],
+        )
+        next_btn.click(
+            next_window,
+            inputs=[selected_session, history_slider],
+            outputs=[conversation, history_slider, window_status],
+        )
+        last_btn.click(
+            last_window,
+            inputs=[selected_session],
+            outputs=[conversation, history_slider, window_status],
         )
         save_title_btn.click(
             save_title,
@@ -333,6 +478,8 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                 meta,
                 conversation,
                 resume_cmd,
+                history_slider,
+                window_status,
                 rename_status,
             ],
         )
