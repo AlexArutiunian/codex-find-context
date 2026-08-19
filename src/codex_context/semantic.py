@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 import heapq
+import os
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+# Keep native math libraries conservative even for manual launches. FastEmbed's
+# explicit `threads=` setting below is the primary ONNX Runtime limit; these are
+# additional guard rails for numpy/BLAS.
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import numpy as np
 
@@ -18,10 +28,21 @@ class SearchResult:
 
 
 class SemanticSearch:
-    def __init__(self, store: Store, model_name: str, cache_dir: Path):
+    def __init__(
+        self,
+        store: Store,
+        model_name: str,
+        cache_dir: Path,
+        threads: int = 2,
+        index_batch_size: int = 32,
+        index_pause_seconds: float = 0.08,
+    ):
         self.store = store
         self.model_name = model_name
         self.cache_dir = cache_dir
+        self.threads = max(1, int(threads))
+        self.index_batch_size = max(1, int(index_batch_size))
+        self.index_pause_seconds = max(0.0, float(index_pause_seconds))
         self._model = None
         self._model_lock = threading.Lock()
         self._index_lock = threading.Lock()
@@ -39,9 +60,15 @@ class SemanticSearch:
                 self._model = TextEmbedding(
                     model_name=self.model_name,
                     cache_dir=str(self.cache_dir),
+                    threads=self.threads,
                 )
             except TypeError:
-                self._model = TextEmbedding(model_name=self.model_name)
+                # Compatibility with older FastEmbed releases that accepted fewer
+                # constructor arguments. Current FastEmbed supports `threads=`.
+                self._model = TextEmbedding(
+                    model_name=self.model_name,
+                    cache_dir=str(self.cache_dir),
+                )
         return self._model
 
     def _prepare(self, text: str, kind: str) -> str:
@@ -102,9 +129,6 @@ class SemanticSearch:
                 serialized.append((chunk_id, b""))
                 failures.append((chunk_id, str(exc)))
 
-        # If absolutely everything failed, this is probably a model/runtime problem,
-        # not 64 independently malformed messages. Retry later instead of marking the
-        # whole corpus as bad.
         if successes == 0:
             raise RuntimeError(
                 "embedding runtime failed for the whole batch and for every single-item retry"
@@ -115,29 +139,29 @@ class SemanticSearch:
             print(f"[codex-context] skipped unembeddable chunk {chunk_id}: {error}")
 
     def ensure_embeddings(self) -> tuple[int, int]:
-        """Build missing embeddings in bounded batches without blocking user search."""
+        """Build missing embeddings slowly in the background without monopolizing the PC."""
         with self._index_lock:
             model = self._load_model()
-            batch_size = 64
 
             while True:
                 pending = self.store.chunks_needing_embeddings(
                     self.model_name,
-                    limit=batch_size,
+                    limit=self.index_batch_size,
                 )
                 if not pending:
                     break
 
                 self._save_batch_resilient(model, pending)
 
+                # Yield CPU and, importantly, give foreground searches a clean chance
+                # to acquire the inference lock between background batches.
+                if self.index_pause_seconds:
+                    time.sleep(self.index_pause_seconds)
+
             return self.store.chunk_counts(self.model_name)
 
     def semantic_search(self, query: str, limit: int = 10) -> list[SearchHit]:
-        """Search only embeddings that are already available.
-
-        Missing embeddings continue to be produced by the background indexer. A
-        user search never synchronously finishes the whole corpus first.
-        """
+        """Search only embeddings that are already available."""
         query = query.strip()
         if not query:
             return []
