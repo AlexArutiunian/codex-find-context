@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from codex_context.app import (
     MESSAGE_WINDOW,
     _first_message_for_snippet,
+    _history_slider_max,
     _render_messages,
     _window_max_first,
     _window_start,
@@ -31,6 +32,15 @@ def test_window_can_jump_to_start_middle_and_end():
     assert _window_start(total, 1) == 0
     assert _window_start(total, 1000) == 999
     assert _window_start(total, 99999) == 2283
+
+
+def test_slider_bounds_are_valid_for_short_or_empty_chats():
+    assert _window_max_first(0) == 1
+    assert _window_max_first(10) == 1
+    assert _history_slider_max(0) == 2
+    assert _history_slider_max(10) == 2
+    assert _history_slider_max(MESSAGE_WINDOW) == 2
+    assert _history_slider_max(MESSAGE_WINDOW + 10) == 11
 
 
 def test_render_messages_limits_html_to_one_window():
