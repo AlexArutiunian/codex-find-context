@@ -21,6 +21,8 @@ jobs:
           pip install -r requirements.txt
       - name: Compile
         run: python -m compileall -q src tests
+      - name: Shell syntax
+        run: bash -n setup.sh run.sh access.sh
       - name: Test
         env:
           PYTHONPATH: src
