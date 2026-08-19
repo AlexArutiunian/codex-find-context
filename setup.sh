@@ -9,11 +9,12 @@ if [[ ! -x .venv/bin/python ]]; then
 fi
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
-chmod +x "$ROOT/setup.sh" "$ROOT/run.sh"
+chmod +x "$ROOT/setup.sh" "$ROOT/run.sh" "$ROOT/access.sh"
 
 echo
 echo "Готово. Ручной запуск: ./run.sh"
 echo "Открыть: http://127.0.0.1:${CODEX_CONTEXT_PORT:-7860}"
+echo "Доступ с планшета/телефона в LAN: ./access.sh lan"
 
 if [[ "${1:-}" == "--autostart" ]]; then
   SERVICE_DIR="$HOME/.config/systemd/user"
