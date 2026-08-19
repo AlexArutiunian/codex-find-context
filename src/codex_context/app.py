@@ -18,18 +18,47 @@ MESSAGE_WINDOW = 400
 MESSAGE_STEP = 400
 
 CSS = """
-.gradio-container { max-width: 1480px !important; }
-#hero { margin-bottom: .4rem; }
-#hero h1 { font-size: 2rem; margin-bottom: .15rem; }
+.gradio-container {
+    max-width: none !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 18px clamp(14px, 2vw, 36px) 30px !important;
+}
+#hero { margin-bottom: .35rem; }
+#hero h1 { font-size: clamp(1.75rem, 2.3vw, 2.35rem); margin-bottom: .12rem; }
 #hero p { opacity: .75; margin-top: 0; }
-.session-shell { height: 620px; overflow-y: auto; padding: 10px 4px; }
-.msg { border: 1px solid var(--border-color-primary); border-radius: 14px; padding: 12px 14px; margin: 9px 2px; }
+.session-shell {
+    height: min(68vh, 780px);
+    min-height: 480px;
+    overflow-y: auto;
+    padding: 10px 4px;
+    scrollbar-gutter: stable;
+}
+.msg {
+    border: 1px solid var(--border-color-primary);
+    border-radius: 14px;
+    padding: 12px 14px;
+    margin: 9px 2px;
+    content-visibility: auto;
+    contain-intrinsic-size: 120px;
+}
 .msg-user { background: color-mix(in srgb, var(--primary-500) 10%, transparent); }
 .msg-assistant { background: color-mix(in srgb, var(--neutral-500) 9%, transparent); }
 .msg-tool { background: color-mix(in srgb, var(--neutral-500) 5%, transparent); opacity: .88; }
 .msg-role { font-size: 12px; text-transform: uppercase; opacity: .6; font-weight: 700; margin-bottom: 7px; }
-.msg-text { white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; line-height: 1.5; }
+.msg-text {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+}
 .small-note { opacity: .72; font-size: 13px; }
+@media (max-width: 900px) {
+    .gradio-container { padding-left: 10px !important; padding-right: 10px !important; }
+    .session-shell { min-height: 420px; height: 62vh; }
+}
 """
 
 
@@ -116,6 +145,9 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
         store=store,
         model_name=settings.embedding_model,
         cache_dir=settings.model_cache_dir,
+        threads=settings.embedding_threads,
+        index_batch_size=settings.index_batch_size,
+        index_pause_seconds=settings.index_pause_seconds,
     )
 
     indexer_guard = threading.Lock()
@@ -144,7 +176,11 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                         )
                         time.sleep(delay)
 
-            indexer_thread = threading.Thread(target=worker, daemon=True)
+            indexer_thread = threading.Thread(
+                target=worker,
+                name="codex-context-indexer",
+                daemon=True,
+            )
             indexer_thread.start()
 
     kick_indexer()
@@ -166,6 +202,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
         )
         return (
             f"**{len(sessions)}** сессий · {semantic_status} · "
+            f"фон: **{settings.embedding_threads} CPU потока** · "
             f"`CODEX_HOME={settings.codex_home}`"
         )
 
@@ -389,7 +426,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
     initial_total = initial_row.message_count if initial_row else 0
     initial_start = _window_start(initial_total)
 
-    with gr.Blocks(title="Codex Context") as demo:
+    with gr.Blocks(title="Codex Context", fill_width=True) as demo:
         selected_session = gr.State(initial_id)
 
         gr.Markdown(
@@ -398,19 +435,19 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
             elem_id="hero",
         )
         status = gr.Markdown(status_markdown())
-        status_timer = gr.Timer(2.0, active=True)
+        status_timer = gr.Timer(settings.status_refresh_seconds, active=True)
 
         with gr.Tabs(selected="chats") as main_tabs:
             with gr.Tab("Чаты", id="chats"):
                 with gr.Row():
-                    with gr.Column(scale=5):
+                    with gr.Column(scale=8):
                         session_selector = gr.Dropdown(
                             choices=initial_choices,
                             value=initial_id,
                             label="Сессия",
                             filterable=True,
                         )
-                    with gr.Column(scale=1, min_width=130):
+                    with gr.Column(scale=1, min_width=150):
                         refresh_btn = gr.Button("↻ Обновить", variant="secondary")
 
                 with gr.Row():
@@ -418,16 +455,16 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                         value=initial_title,
                         label="Моё название",
                         placeholder="Например: RWB — TensorRT и RealSense align",
-                        scale=6,
+                        scale=8,
                     )
                     save_title_btn = gr.Button("Сохранить", variant="primary", scale=1)
                     reset_title_btn = gr.Button("Сбросить", scale=1)
                 rename_status = gr.Markdown()
 
                 with gr.Row():
-                    with gr.Column(scale=3):
+                    with gr.Column(scale=7):
                         meta = gr.Markdown(initial_meta)
-                    with gr.Column(scale=2):
+                    with gr.Column(scale=3):
                         resume_cmd = gr.Code(
                             value=initial_resume,
                             language="shell",
@@ -462,7 +499,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                     query = gr.Textbox(
                         label="Что ищем",
                         placeholder="например: где я чинил align depth у RealSense и переходил на 640x480",
-                        scale=6,
+                        scale=8,
                     )
                     top_k = gr.Slider(3, 30, value=10, step=1, label="Top-k", scale=1)
                     search_btn = gr.Button("Найти", variant="primary", scale=1)
@@ -559,7 +596,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
 def main() -> None:
     settings = Settings.from_env()
     app = create_app(settings)
-    app.queue(default_concurrency_limit=4).launch(
+    app.queue(default_concurrency_limit=2).launch(
         server_name=settings.host,
         server_port=settings.port,
         inbrowser=False,
