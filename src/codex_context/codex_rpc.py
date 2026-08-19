@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Iterable
 
 
 class CodexRpcError(RuntimeError):
@@ -24,7 +25,6 @@ def _resolve_codex_bin() -> str:
         return direct
 
     # systemd --user may have a smaller PATH than an interactive terminal.
-    # Ask the user's login shell as a fallback so npm/nvm/local installs still work.
     try:
         result = subprocess.run(
             ["bash", "-lc", "command -v codex"],
@@ -53,25 +53,33 @@ def _resolve_codex_bin() -> str:
     )
 
 
-def set_thread_name(codex_home: Path, thread_id: str, name: str, timeout: float = 12.0) -> None:
-    """Persist a thread name through Codex's own local app-server API.
-
-    Codex exposes the stable v2 method `thread/name/set`. We intentionally talk
-    to the installed Codex binary instead of editing its SQLite/state files
-    directly, so this follows whatever persistence format the installed version
-    currently uses.
-    """
-    name = " ".join(name.split()).strip()
-    if not name:
+def _normalize_name(name: str) -> str:
+    normalized = " ".join(name.split()).strip()
+    if not normalized:
         raise CodexRpcError("Название не может быть пустым")
+    return normalized
+
+
+def set_thread_names(
+    codex_home: Path,
+    updates: Iterable[tuple[str, str]],
+    timeout: float = 20.0,
+) -> dict[str, str]:
+    """Persist multiple names through one Codex app-server process.
+
+    Returns a mapping of thread_id -> error only for failed updates. An empty
+    mapping means every requested rename was accepted by Codex.
+    """
+    normalized_updates = [(thread_id, _normalize_name(name)) for thread_id, name in updates]
+    if not normalized_updates:
+        return {}
 
     codex_bin = _resolve_codex_bin()
     env = os.environ.copy()
     env["CODEX_HOME"] = str(codex_home)
 
     init_id = "codex-context-init"
-    rename_id = "codex-context-rename"
-    messages = [
+    messages: list[dict] = [
         {
             "id": init_id,
             "method": "initialize",
@@ -85,14 +93,20 @@ def set_thread_name(codex_home: Path, thread_id: str, name: str, timeout: float 
             },
         },
         {"method": "initialized"},
-        {
-            "id": rename_id,
-            "method": "thread/name/set",
-            "params": {"threadId": thread_id, "name": name},
-        },
     ]
-    payload = "".join(json.dumps(message, ensure_ascii=False) + "\n" for message in messages)
+    request_to_thread: dict[str, str] = {}
+    for index, (thread_id, name) in enumerate(normalized_updates):
+        request_id = f"codex-context-rename-{index}"
+        request_to_thread[request_id] = thread_id
+        messages.append(
+            {
+                "id": request_id,
+                "method": "thread/name/set",
+                "params": {"threadId": thread_id, "name": name},
+            }
+        )
 
+    payload = "".join(json.dumps(message, ensure_ascii=False) + "\n" for message in messages)
     try:
         completed = subprocess.run(
             [codex_bin, "app-server", "--listen", "stdio://"],
@@ -108,7 +122,7 @@ def set_thread_name(codex_home: Path, thread_id: str, name: str, timeout: float 
     except OSError as exc:
         raise CodexRpcError(f"Не удалось запустить Codex app-server: {exc}") from exc
 
-    rename_response = None
+    responses: dict[str, dict] = {}
     for line in completed.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -117,19 +131,32 @@ def set_thread_name(codex_home: Path, thread_id: str, name: str, timeout: float 
             message = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(message, dict) and str(message.get("id")) == rename_id:
-            rename_response = message
-            break
+        if not isinstance(message, dict):
+            continue
+        request_id = str(message.get("id", ""))
+        if request_id in request_to_thread:
+            responses[request_id] = message
 
-    if rename_response is None:
-        detail = completed.stderr.strip().splitlines()
-        tail = detail[-1] if detail else f"exit code {completed.returncode}"
-        raise CodexRpcError(f"Codex не вернул ответ на thread/name/set: {tail}")
+    stderr_lines = completed.stderr.strip().splitlines()
+    stderr_tail = stderr_lines[-1] if stderr_lines else f"exit code {completed.returncode}"
+    failures: dict[str, str] = {}
+    for request_id, thread_id in request_to_thread.items():
+        response = responses.get(request_id)
+        if response is None:
+            failures[thread_id] = f"Codex не вернул ответ на thread/name/set: {stderr_tail}"
+            continue
+        error = response.get("error")
+        if error:
+            if isinstance(error, dict):
+                detail = error.get("message") or json.dumps(error, ensure_ascii=False)
+            else:
+                detail = str(error)
+            failures[thread_id] = f"Codex отклонил переименование: {detail}"
+    return failures
 
-    error = rename_response.get("error")
-    if error:
-        if isinstance(error, dict):
-            message = error.get("message") or json.dumps(error, ensure_ascii=False)
-        else:
-            message = str(error)
-        raise CodexRpcError(f"Codex отклонил переименование: {message}")
+
+def set_thread_name(codex_home: Path, thread_id: str, name: str, timeout: float = 12.0) -> None:
+    """Persist one thread name through Codex's native `thread/name/set` RPC."""
+    failures = set_thread_names(codex_home, [(thread_id, name)], timeout=timeout)
+    if thread_id in failures:
+        raise CodexRpcError(failures[thread_id])
