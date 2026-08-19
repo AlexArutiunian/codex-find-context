@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import shutil
 import sqlite3
 import subprocess
 import threading
+import time
+from collections import deque
 from pathlib import Path
 from typing import Iterable
 
@@ -62,12 +65,186 @@ def _normalize_name(name: str) -> str:
     return normalized
 
 
+class _CodexStdioClient:
+    """Tiny synchronous JSON-RPC client for `codex app-server --listen stdio://`.
+
+    Codex's own SDK keeps stdin open, flushes every JSON line and waits for the
+    matching response before continuing. We mirror that lifecycle here instead
+    of using subprocess.run(input=...), which closes stdin immediately and can
+    make app-server exit cleanly before responses are observed.
+    """
+
+    def __init__(self, codex_bin: str, codex_home: Path, timeout: float):
+        self.codex_bin = codex_bin
+        self.codex_home = codex_home
+        self.timeout = max(1.0, float(timeout))
+        self.proc: subprocess.Popen[str] | None = None
+        self.messages: queue.Queue[dict | BaseException | None] = queue.Queue()
+        self.stderr_tail: deque[str] = deque(maxlen=80)
+        self._write_lock = threading.Lock()
+        self._stdout_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_CodexStdioClient":
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(self.codex_home)
+        try:
+            self.proc = subprocess.Popen(
+                [self.codex_bin, "app-server", "--listen", "stdio://"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+                env=env,
+            )
+        except OSError as exc:
+            raise CodexRpcError(f"Не удалось запустить Codex app-server: {exc}") from exc
+
+        self._stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        proc = self.proc
+        self.proc = None
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except OSError:
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+
+    def _read_stdout(self) -> None:
+        proc = self.proc
+        if proc is None or proc.stdout is None:
+            self.messages.put(None)
+            return
+        try:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    self.messages.put(CodexRpcError(f"Некорректный JSON от Codex app-server: {line[:300]!r}"))
+                    continue
+                if isinstance(message, dict):
+                    self.messages.put(message)
+        except BaseException as exc:  # reader thread must wake the waiting request
+            self.messages.put(exc)
+        finally:
+            self.messages.put(None)
+
+    def _read_stderr(self) -> None:
+        proc = self.proc
+        if proc is None or proc.stderr is None:
+            return
+        for line in proc.stderr:
+            self.stderr_tail.append(line.rstrip("\n"))
+
+    def _stderr_detail(self) -> str:
+        detail = "\n".join(self.stderr_tail).strip()
+        proc = self.proc
+        if detail:
+            return detail[-2000:]
+        if proc is not None and proc.poll() is not None:
+            return f"exit code {proc.returncode}"
+        return "stdout закрыт без сообщения об ошибке"
+
+    def send(self, payload: dict) -> None:
+        proc = self.proc
+        if proc is None or proc.stdin is None:
+            raise CodexRpcError("Codex app-server не запущен")
+        with self._write_lock:
+            try:
+                proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise CodexRpcError(
+                    f"Codex app-server закрыл stdin: {self._stderr_detail()}"
+                ) from exc
+
+    def notify(self, method: str, params: dict | None = None) -> None:
+        payload: dict = {"method": method}
+        if params is not None:
+            payload["params"] = params
+        self.send(payload)
+
+    def request(self, request_id: str, method: str, params: dict | None = None) -> dict:
+        payload: dict = {"id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        self.send(payload)
+
+        deadline = time.monotonic() + self.timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CodexRpcError(
+                    f"Codex app-server не ответил на {method} за {self.timeout:g} с. "
+                    f"{self._stderr_detail()}"
+                )
+            try:
+                message = self.messages.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise CodexRpcError(
+                    f"Codex app-server не ответил на {method} за {self.timeout:g} с. "
+                    f"{self._stderr_detail()}"
+                ) from exc
+
+            if message is None:
+                raise CodexRpcError(
+                    f"Codex app-server закрыл stdout до ответа на {method}: {self._stderr_detail()}"
+                )
+            if isinstance(message, BaseException):
+                if isinstance(message, CodexRpcError):
+                    raise message
+                raise CodexRpcError(f"Ошибка чтения Codex app-server: {message}") from message
+
+            # App-server may ask the client an approval question. Renaming should
+            # not need one, but acknowledge unknown server requests so the RPC
+            # stream can never deadlock on an unexpected request.
+            if "method" in message and "id" in message:
+                self.send({"id": message["id"], "result": {}})
+                continue
+
+            if str(message.get("id", "")) != request_id:
+                # Notification or an unrelated response; there is only one
+                # outstanding request in this tiny client, so it is safe to skip.
+                continue
+            return message
+
+
+def _response_error(response: dict) -> str | None:
+    error = response.get("error")
+    if not error:
+        return None
+    if isinstance(error, dict):
+        detail = error.get("message") or json.dumps(error, ensure_ascii=False)
+    else:
+        detail = str(error)
+    return str(detail)
+
+
 def set_thread_names(
     codex_home: Path,
     updates: Iterable[tuple[str, str]],
     timeout: float = 20.0,
 ) -> dict[str, str]:
-    """Persist multiple names through one Codex app-server process.
+    """Persist multiple names through one live Codex app-server process.
 
     Returns a mapping of thread_id -> error only for failed updates. An empty
     mapping means every requested rename was accepted by Codex.
@@ -77,15 +254,13 @@ def set_thread_names(
         return {}
 
     codex_bin = _resolve_codex_bin()
-    env = os.environ.copy()
-    env["CODEX_HOME"] = str(codex_home)
+    failures: dict[str, str] = {}
 
-    init_id = "codex-context-init"
-    messages: list[dict] = [
-        {
-            "id": init_id,
-            "method": "initialize",
-            "params": {
+    with _CodexStdioClient(codex_bin, codex_home, timeout) as client:
+        init_response = client.request(
+            "codex-context-init",
+            "initialize",
+            {
                 "clientInfo": {
                     "name": "codex-context",
                     "title": "Codex Context",
@@ -93,67 +268,32 @@ def set_thread_names(
                 },
                 "capabilities": {"experimentalApi": True},
             },
-        },
-        {"method": "initialized"},
-    ]
-    request_to_thread: dict[str, str] = {}
-    for index, (thread_id, name) in enumerate(normalized_updates):
-        request_id = f"codex-context-rename-{index}"
-        request_to_thread[request_id] = thread_id
-        messages.append(
-            {
-                "id": request_id,
-                "method": "thread/name/set",
-                "params": {"threadId": thread_id, "name": name},
-            }
         )
+        init_error = _response_error(init_response)
+        if init_error:
+            raise CodexRpcError(f"Codex отклонил initialize: {init_error}")
+        client.notify("initialized")
 
-    payload = "".join(json.dumps(message, ensure_ascii=False) + "\n" for message in messages)
-    try:
-        completed = subprocess.run(
-            [codex_bin, "app-server", "--listen", "stdio://"],
-            input=payload,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            env=env,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise CodexRpcError(f"Codex app-server не ответил за {timeout:g} с") from exc
-    except OSError as exc:
-        raise CodexRpcError(f"Не удалось запустить Codex app-server: {exc}") from exc
+        for index, (thread_id, name) in enumerate(normalized_updates):
+            request_id = f"codex-context-rename-{index}"
+            try:
+                response = client.request(
+                    request_id,
+                    "thread/name/set",
+                    {"threadId": thread_id, "name": name},
+                )
+            except CodexRpcError as exc:
+                failures[thread_id] = str(exc)
+                # A transport error usually means the process is gone, so later
+                # requests cannot succeed. Record the same failure for the rest.
+                for remaining_thread_id, _ in normalized_updates[index + 1 :]:
+                    failures.setdefault(remaining_thread_id, str(exc))
+                break
 
-    responses: dict[str, dict] = {}
-    for line in completed.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(message, dict):
-            continue
-        request_id = str(message.get("id", ""))
-        if request_id in request_to_thread:
-            responses[request_id] = message
+            error = _response_error(response)
+            if error:
+                failures[thread_id] = f"Codex отклонил переименование: {error}"
 
-    stderr_lines = completed.stderr.strip().splitlines()
-    stderr_tail = stderr_lines[-1] if stderr_lines else f"exit code {completed.returncode}"
-    failures: dict[str, str] = {}
-    for request_id, thread_id in request_to_thread.items():
-        response = responses.get(request_id)
-        if response is None:
-            failures[thread_id] = f"Codex не вернул ответ на thread/name/set: {stderr_tail}"
-            continue
-        error = response.get("error")
-        if error:
-            if isinstance(error, dict):
-                detail = error.get("message") or json.dumps(error, ensure_ascii=False)
-            else:
-                detail = str(error)
-            failures[thread_id] = f"Codex отклонил переименование: {detail}"
     return failures
 
 
