@@ -268,15 +268,22 @@ class Store:
             )
         return total, embedded
 
-    def chunks_needing_embeddings(self, embedding_model: str) -> list[tuple[int, str]]:
+    def chunks_needing_embeddings(
+        self,
+        embedding_model: str,
+        limit: int = 64,
+    ) -> list[tuple[int, str]]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT id, text FROM chunks
                 WHERE embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?
                 ORDER BY id
+                LIMIT ?
                 """,
-                (embedding_model,),
+                (embedding_model, limit),
             ).fetchall()
         return [(int(row["id"]), str(row["text"])) for row in rows]
 
@@ -291,18 +298,19 @@ class Store:
 
     def iter_embeddings(self, embedding_model: str):
         with self._connect() as conn:
-            rows = conn.execute(
+            cursor = conn.execute(
                 """
                 SELECT c.id, c.session_id, c.role, c.text, c.embedding,
                        COALESCE(s.custom_title, s.original_title) AS title
                 FROM chunks c
                 JOIN sessions s ON s.session_id = c.session_id
                 WHERE c.embedding_model = ? AND c.embedding IS NOT NULL
+                ORDER BY c.id
                 """,
                 (embedding_model,),
-            ).fetchall()
-        for row in rows:
-            yield row
+            )
+            for row in cursor:
+                yield row
 
     @staticmethod
     def _fts_query(query: str) -> str:

@@ -53,19 +53,23 @@ class SemanticSearch:
         return array
 
     def ensure_embeddings(self) -> tuple[int, int]:
+        """Build missing embeddings without materializing the whole corpus in RAM."""
         with self._lock:
-            pending = self.store.chunks_needing_embeddings(self.model_name)
-            if not pending:
-                return self.store.chunk_counts(self.model_name)
-
             model = self._load_model()
             batch_size = 64
-            for start in range(0, len(pending), batch_size):
-                batch = pending[start : start + batch_size]
-                texts = [self._prepare(text, "passage") for _, text in batch]
-                vectors = list(model.embed(texts))
+
+            while True:
+                pending = self.store.chunks_needing_embeddings(
+                    self.model_name,
+                    limit=batch_size,
+                )
+                if not pending:
+                    break
+
+                texts = [self._prepare(text, "passage") for _, text in pending]
+                vectors = model.embed(texts, batch_size=batch_size)
                 serialized: list[tuple[int, bytes]] = []
-                for (chunk_id, _), vector in zip(batch, vectors, strict=True):
+                for (chunk_id, _), vector in zip(pending, vectors, strict=True):
                     normalized = self._normalized(vector)
                     serialized.append((chunk_id, normalized.tobytes()))
                 self.store.save_embeddings(self.model_name, serialized)
@@ -79,7 +83,7 @@ class SemanticSearch:
         self.ensure_embeddings()
         model = self._load_model()
         query_vector = self._normalized(
-            next(iter(model.embed([self._prepare(query, "query")])))
+            next(iter(model.embed([self._prepare(query, "query")], batch_size=1)))
         )
 
         heap: list[tuple[float, int, SearchHit]] = []
