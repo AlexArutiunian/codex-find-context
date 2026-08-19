@@ -15,6 +15,22 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
 @dataclass(frozen=True)
 class Settings:
     codex_home: Path
@@ -22,6 +38,10 @@ class Settings:
     db_path: Path
     model_cache_dir: Path
     embedding_model: str
+    embedding_threads: int
+    index_batch_size: int
+    index_pause_seconds: float
+    status_refresh_seconds: float
     host: str
     port: int
     auto_index: bool
@@ -40,6 +60,12 @@ class Settings:
             embedding_model=os.getenv(
                 "CODEX_CONTEXT_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL
             ),
+            # This is a background desktop service, not a benchmark. FastEmbed passes
+            # this value to ONNX Runtime, preventing it from consuming every CPU core.
+            embedding_threads=_env_int("CODEX_CONTEXT_EMBED_THREADS", 2),
+            index_batch_size=_env_int("CODEX_CONTEXT_INDEX_BATCH", 32),
+            index_pause_seconds=_env_float("CODEX_CONTEXT_INDEX_PAUSE", 0.08),
+            status_refresh_seconds=_env_float("CODEX_CONTEXT_STATUS_REFRESH", 5.0, 1.0),
             host=os.getenv("CODEX_CONTEXT_HOST", "127.0.0.1"),
             port=int(os.getenv("CODEX_CONTEXT_PORT", "7860")),
             auto_index=_env_bool("CODEX_CONTEXT_AUTO_INDEX", True),
