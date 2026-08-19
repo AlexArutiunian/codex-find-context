@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -160,3 +162,51 @@ def set_thread_name(codex_home: Path, thread_id: str, name: str, timeout: float 
     failures = set_thread_names(codex_home, [(thread_id, name)], timeout=timeout)
     if thread_id in failures:
         raise CodexRpcError(failures[thread_id])
+
+
+def _migrate_saved_titles() -> None:
+    """Best-effort migration for titles saved by older Codex Context versions."""
+    data_dir = Path(
+        os.getenv("CODEX_CONTEXT_DATA_DIR", "~/.local/share/codex-find-context")
+    ).expanduser()
+    db_path = data_dir / "index.sqlite3"
+    if not db_path.is_file():
+        return
+
+    try:
+        with sqlite3.connect(db_path, timeout=5) as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, custom_title
+                FROM sessions
+                WHERE custom_title IS NOT NULL AND trim(custom_title) != ''
+                ORDER BY session_id
+                """
+            ).fetchall()
+    except sqlite3.Error as exc:
+        print(f"[codex-context] saved-title migration could not read local DB: {exc}")
+        return
+
+    updates = [(str(session_id), str(title)) for session_id, title in rows]
+    if not updates:
+        return
+
+    codex_home = Path(os.getenv("CODEX_HOME", "~/.codex")).expanduser()
+    try:
+        failures = set_thread_names(codex_home, updates)
+    except CodexRpcError as exc:
+        print(f"[codex-context] saved-title migration unavailable: {exc}")
+        return
+
+    if failures:
+        print(
+            "[codex-context] saved-title migration partial failure: "
+            + "; ".join(f"{thread_id}: {error}" for thread_id, error in failures.items())
+        )
+    else:
+        print(f"[codex-context] synced {len(updates)} saved title(s) into Codex metadata")
+
+
+# Runs once per Codex Context process, in the background, so old custom titles
+# survive the transition from local-only naming to Codex-native naming.
+threading.Thread(target=_migrate_saved_titles, daemon=True).start()
