@@ -16,6 +16,7 @@ from .store import SessionRow, Store
 
 MESSAGE_WINDOW = 400
 MESSAGE_STEP = 400
+ALL_SEARCH_SCOPE = "__all__"
 
 CSS = """
 .gradio-container {
@@ -192,6 +193,18 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
         value = preferred if preferred in ids else (sessions[0].session_id if sessions else None)
         return sessions, choices, value
 
+    def search_scope_choices():
+        sessions = store.list_sessions()
+        return [("🌐 Все чаты", ALL_SEARCH_SCOPE)] + [
+            (_session_label(row), row.session_id) for row in sessions
+        ]
+
+    def search_scope_update(current: str | None = None):
+        choices = search_scope_choices()
+        valid_values = {value for _, value in choices}
+        value = current if current in valid_values else ALL_SEARCH_SCOPE
+        return gr.update(choices=choices, value=value)
+
     def status_markdown() -> str:
         sessions = store.list_sessions()
         total, embedded = store.chunk_counts(settings.embedding_model)
@@ -259,7 +272,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
             window_note,
         )
 
-    def refresh(preferred: str | None):
+    def refresh(preferred: str | None, current_search_scope: str | None):
         sync = store.sync_sessions()
         kick_indexer()
         _, choices, value = choices_and_default(preferred)
@@ -270,6 +283,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
         )
         return (
             gr.update(choices=choices, value=value),
+            search_scope_update(current_search_scope),
             value,
             title,
             meta,
@@ -304,13 +318,13 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
         target_first = min(max_start, current_start + MESSAGE_STEP) + 1
         return render_window(session_id, target_first)
 
-    def save_title(session_id: str | None, title: str):
+    def save_title(session_id: str | None, title: str, current_search_scope: str | None):
         if not session_id:
-            return gr.update(), "Сначала выбери сессию."
+            return gr.update(), gr.update(), "Сначала выбери сессию."
         try:
             store.rename_session(session_id, title)
         except (ValueError, KeyError) as exc:
-            return gr.update(), f"⚠️ {exc}"
+            return gr.update(), gr.update(), f"⚠️ {exc}"
 
         row = store.get_session(session_id)
         normalized_title = row.title if row else " ".join(title.split()).strip()
@@ -322,20 +336,22 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
 
         _, choices, _ = choices_and_default(session_id)
         selector = gr.update(choices=choices, value=session_id)
+        scope = search_scope_update(current_search_scope)
         if native_error:
             return (
                 selector,
+                scope,
                 "⚠️ Название сохранено в Codex Context, но сам Codex не обновился: "
                 f"`{native_error}`",
             )
-        return selector, "✅ Название сохранено и в Codex, и в Codex Context."
+        return selector, scope, "✅ Название сохранено и в Codex, и в Codex Context."
 
-    def reset_title(session_id: str | None):
+    def reset_title(session_id: str | None, current_search_scope: str | None):
         if not session_id:
-            return gr.update(), "", "Сначала выбери сессию."
+            return gr.update(), gr.update(), "", "Сначала выбери сессию."
         row_before = store.get_session(session_id)
         if row_before is None:
-            return gr.update(), "", "Сессия не найдена."
+            return gr.update(), gr.update(), "", "Сессия не найдена."
 
         store.clear_custom_title(session_id)
         row = store.get_session(session_id)
@@ -348,32 +364,46 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
 
         _, choices, _ = choices_and_default(session_id)
         selector = gr.update(choices=choices, value=session_id)
+        scope = search_scope_update(current_search_scope)
         if native_error:
             note = f"⚠️ Локальное название сброшено, но Codex не обновился: `{native_error}`"
         else:
             note = "Название сброшено и синхронизировано с Codex."
-        return selector, restored, note
+        return selector, scope, restored, note
 
-    def do_search(query: str, top_k: int):
+    def do_search(query: str, top_k: int, scope_value: str | None):
         query = query.strip()
         if not query:
             return [], "Введи, что ты помнишь о старой работе."
+
         store.sync_sessions()
         kick_indexer()
-        result = semantic.search(query, int(top_k))
+        session_id = None if not scope_value or scope_value == ALL_SEARCH_SCOPE else scope_value
+        scope_row = store.get_session(session_id) if session_id else None
+        if session_id and scope_row is None:
+            return [], "⚠️ Выбранный чат больше не найден. Нажми «Обновить»."
+
+        result = semantic.search(query, int(top_k), session_id=session_id)
         rows = []
         for hit in result.hits:
             snippet = " ".join(hit.text.split())
             if len(snippet) > 420:
                 snippet = snippet[:419].rstrip() + "…"
             rows.append([hit.title, hit.role, round(hit.score, 4), snippet, hit.session_id])
+
+        scope_text = (
+            f"в чате **{scope_row.title}**"
+            if scope_row is not None
+            else "по всем чатам"
+        )
         if result.mode == "semantic":
-            note = f"Нашёл {len(rows)} совпадений локальным semantic search."
+            note = f"Нашёл {len(rows)} совпадений {scope_text} локальным semantic search."
             if result.detail:
                 note += f" {result.detail}."
         else:
             note = (
-                "⚠️ Semantic model сейчас недоступна; показан локальный FTS fallback. "
+                f"⚠️ Semantic model сейчас недоступна {scope_text}; "
+                "показан локальный FTS fallback. "
                 f"Причина: `{result.detail}`"
             )
         return rows, note
@@ -414,6 +444,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
         )
 
     _, initial_choices, initial_id = choices_and_default()
+    initial_search_choices = [("🌐 Все чаты", ALL_SEARCH_SCOPE)] + initial_choices
     (
         initial_title,
         initial_meta,
@@ -493,12 +524,21 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
             with gr.Tab("Поиск по смыслу", id="search"):
                 gr.Markdown(
                     "Опиши не точную фразу, а **что ты тогда делал**. "
-                    "Поиск идёт локально по user/assistant сообщениям и важным tool/command фрагментам."
+                    "Можно искать по всей истории или только внутри одного выбранного чата."
                 )
                 with gr.Row():
+                    search_scope = gr.Dropdown(
+                        choices=initial_search_choices,
+                        value=ALL_SEARCH_SCOPE,
+                        label="Где искать",
+                        filterable=True,
+                        scale=8,
+                    )
+                    current_chat_btn = gr.Button("Текущий чат", variant="secondary", scale=1)
+                with gr.Row():
                     query = gr.Textbox(
-                        label="Что ищем",
-                        placeholder="например: где я чинил align depth у RealSense и переходил на 640x480",
+                        label="Что ищем внутри выбранной области",
+                        placeholder="например: где в этом чате я менял threshold и почему",
                         scale=8,
                     )
                     top_k = gr.Slider(3, 30, value=10, step=1, label="Top-k", scale=1)
@@ -509,7 +549,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                     datatype=["str", "str", "number", "str", "str"],
                     interactive=False,
                     wrap=True,
-                    label="Кликни по строке, чтобы открыть чат",
+                    label="Кликни по строке, чтобы открыть точное место в чате",
                 )
 
         status_timer.tick(
@@ -520,10 +560,10 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
         )
         refresh_btn.click(
             refresh,
-            inputs=[selected_session],
+            inputs=[selected_session, search_scope],
             outputs=[
-                session_selector, selected_session, title_box, meta, conversation,
-                resume_cmd, history_slider, window_status, status, rename_status,
+                session_selector, search_scope, selected_session, title_box, meta,
+                conversation, resume_cmd, history_slider, window_status, status, rename_status,
             ],
         )
         # .input fires only for user interaction. Programmatic dropdown updates from
@@ -563,22 +603,27 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
         )
         save_title_btn.click(
             save_title,
-            inputs=[selected_session, title_box],
-            outputs=[session_selector, rename_status],
+            inputs=[selected_session, title_box, search_scope],
+            outputs=[session_selector, search_scope, rename_status],
         )
         reset_title_btn.click(
             reset_title,
+            inputs=[selected_session, search_scope],
+            outputs=[session_selector, search_scope, title_box, rename_status],
+        )
+        current_chat_btn.click(
+            lambda session_id: gr.update(value=session_id or ALL_SEARCH_SCOPE),
             inputs=[selected_session],
-            outputs=[session_selector, title_box, rename_status],
+            outputs=[search_scope],
         )
         search_btn.click(
             do_search,
-            inputs=[query, top_k],
+            inputs=[query, top_k, search_scope],
             outputs=[results, search_note],
         )
         query.submit(
             do_search,
-            inputs=[query, top_k],
+            inputs=[query, top_k, search_scope],
             outputs=[results, search_note],
         )
         results.select(
