@@ -86,6 +86,8 @@ class Store:
 
                 CREATE INDEX IF NOT EXISTS idx_chunks_session ON chunks(session_id);
                 CREATE INDEX IF NOT EXISTS idx_chunks_embedding_model ON chunks(embedding_model);
+                CREATE INDEX IF NOT EXISTS idx_chunks_session_embedding_model
+                    ON chunks(session_id, embedding_model);
 
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                     chunk_id UNINDEXED,
@@ -160,7 +162,7 @@ class Store:
                     parsed.session_id,
                     str(parsed.path),
                     mtime_ns,
-                    size_bytes,
+                    stat_size := size_bytes,
                     parsed.original_title,
                     custom_title,
                     parsed.cwd,
@@ -257,15 +259,36 @@ class Store:
                 (session_id,),
             )
 
-    def chunk_counts(self, embedding_model: str) -> tuple[int, int]:
+    def chunk_counts(
+        self,
+        embedding_model: str,
+        session_id: str | None = None,
+    ) -> tuple[int, int]:
         with self._connect() as conn:
-            total = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
-            embedded = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM chunks WHERE embedding_model = ? AND embedding IS NOT NULL",
-                    (embedding_model,),
-                ).fetchone()[0]
-            )
+            if session_id is None:
+                total = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+                embedded = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM chunks WHERE embedding_model = ? AND embedding IS NOT NULL",
+                        (embedding_model,),
+                    ).fetchone()[0]
+                )
+            else:
+                total = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM chunks WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()[0]
+                )
+                embedded = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM chunks
+                        WHERE session_id = ? AND embedding_model = ? AND embedding IS NOT NULL
+                        """,
+                        (session_id, embedding_model),
+                    ).fetchone()[0]
+                )
         return total, embedded
 
     def chunks_needing_embeddings(
@@ -296,19 +319,38 @@ class Store:
                 ((blob, embedding_model, chunk_id) for chunk_id, blob in rows),
             )
 
-    def iter_embeddings(self, embedding_model: str):
+    def iter_embeddings(
+        self,
+        embedding_model: str,
+        session_id: str | None = None,
+    ):
         with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                SELECT c.id, c.session_id, c.role, c.text, c.embedding,
-                       COALESCE(s.custom_title, s.original_title) AS title
-                FROM chunks c
-                JOIN sessions s ON s.session_id = c.session_id
-                WHERE c.embedding_model = ? AND c.embedding IS NOT NULL
-                ORDER BY c.id
-                """,
-                (embedding_model,),
-            )
+            if session_id is None:
+                cursor = conn.execute(
+                    """
+                    SELECT c.id, c.session_id, c.role, c.text, c.embedding,
+                           COALESCE(s.custom_title, s.original_title) AS title
+                    FROM chunks c
+                    JOIN sessions s ON s.session_id = c.session_id
+                    WHERE c.embedding_model = ? AND c.embedding IS NOT NULL
+                    ORDER BY c.id
+                    """,
+                    (embedding_model,),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT c.id, c.session_id, c.role, c.text, c.embedding,
+                           COALESCE(s.custom_title, s.original_title) AS title
+                    FROM chunks c
+                    JOIN sessions s ON s.session_id = c.session_id
+                    WHERE c.session_id = ?
+                      AND c.embedding_model = ?
+                      AND c.embedding IS NOT NULL
+                    ORDER BY c.id
+                    """,
+                    (session_id, embedding_model),
+                )
             for row in cursor:
                 yield row
 
@@ -318,25 +360,46 @@ class Store:
         escaped = [token.replace('"', '""') for token in tokens[:20]]
         return " OR ".join(f'"{token}"' for token in escaped)
 
-    def lexical_search(self, query: str, limit: int = 10) -> list[SearchHit]:
+    def lexical_search(
+        self,
+        query: str,
+        limit: int = 10,
+        session_id: str | None = None,
+    ) -> list[SearchHit]:
         fts_query = self._fts_query(query)
         if not fts_query:
             return []
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT c.session_id, c.role, c.text,
-                       COALESCE(s.custom_title, s.original_title) AS title,
-                       bm25(chunks_fts) AS rank
-                FROM chunks_fts
-                JOIN chunks c ON c.id = chunks_fts.chunk_id
-                JOIN sessions s ON s.session_id = c.session_id
-                WHERE chunks_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (fts_query, limit),
-            ).fetchall()
+            if session_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT c.session_id, c.role, c.text,
+                           COALESCE(s.custom_title, s.original_title) AS title,
+                           bm25(chunks_fts) AS rank
+                    FROM chunks_fts
+                    JOIN chunks c ON c.id = chunks_fts.chunk_id
+                    JOIN sessions s ON s.session_id = c.session_id
+                    WHERE chunks_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (fts_query, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT c.session_id, c.role, c.text,
+                           COALESCE(s.custom_title, s.original_title) AS title,
+                           bm25(chunks_fts) AS rank
+                    FROM chunks_fts
+                    JOIN chunks c ON c.id = chunks_fts.chunk_id
+                    JOIN sessions s ON s.session_id = c.session_id
+                    WHERE chunks_fts MATCH ? AND c.session_id = ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (fts_query, session_id, limit),
+                ).fetchall()
         hits: list[SearchHit] = []
         for index, row in enumerate(rows):
             hits.append(
