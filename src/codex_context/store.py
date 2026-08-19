@@ -162,7 +162,7 @@ class Store:
                     parsed.session_id,
                     str(parsed.path),
                     mtime_ns,
-                    stat_size := size_bytes,
+                    size_bytes,
                     parsed.original_title,
                     custom_title,
                     parsed.cwd,
