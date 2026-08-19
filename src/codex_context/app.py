@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -67,6 +68,29 @@ def _window_max_first(total_messages: int) -> int:
     return max(1, total_messages - MESSAGE_WINDOW + 1)
 
 
+def _normalize_match_text(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _first_message_for_snippet(messages, snippet: str) -> int | None:
+    """Return a one-based window start centered near a semantic-search snippet."""
+    needle = _normalize_match_text(snippet).rstrip("…").strip()
+    if not needle or not messages:
+        return None
+
+    # Search result previews are capped at ~420 chars. A stable prefix is enough to
+    # relocate the source message even if the original contained newlines.
+    probe = needle[:220]
+    short_probe = needle[:120]
+    for index, message in enumerate(messages):
+        haystack = _normalize_match_text(message.text)
+        if probe in haystack or (len(short_probe) >= 40 and short_probe in haystack):
+            desired_start = max(0, index - MESSAGE_WINDOW // 2)
+            max_start = max(0, len(messages) - MESSAGE_WINDOW)
+            return min(desired_start, max_start) + 1
+    return None
+
+
 def _render_messages(messages, start: int = 0) -> str:
     if not messages:
         return '<div class="small-note">В этой сессии не удалось извлечь видимые сообщения.</div>'
@@ -99,10 +123,19 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
 
     if settings.auto_index:
         def warm_semantic_index() -> None:
-            try:
-                semantic.ensure_embeddings()
-            except Exception as exc:
-                print(f"[codex-context] semantic warmup failed: {exc}")
+            failures = 0
+            while True:
+                try:
+                    semantic.ensure_embeddings()
+                    return
+                except Exception as exc:
+                    failures += 1
+                    delay = min(10, 2 * failures)
+                    print(
+                        "[codex-context] semantic warmup failed; "
+                        f"retrying in {delay}s: {exc}"
+                    )
+                    time.sleep(delay)
 
         threading.Thread(target=warm_semantic_index, daemon=True).start()
 
@@ -250,17 +283,15 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
     def do_search(query: str, top_k: int):
         query = query.strip()
         if not query:
-            return [], [], "Введи, что ты помнишь о старой работе."
+            return [], "Введи, что ты помнишь о старой работе."
         store.sync_sessions()
         result = semantic.search(query, int(top_k))
         rows = []
-        state = []
         for hit in result.hits:
             snippet = " ".join(hit.text.split())
             if len(snippet) > 420:
                 snippet = snippet[:419].rstrip() + "…"
             rows.append([hit.title, hit.role, round(hit.score, 4), snippet, hit.session_id])
-            state.append({"session_id": hit.session_id})
         if result.mode == "semantic":
             note = f"Нашёл {len(rows)} совпадений локальным semantic search."
             if result.detail:
@@ -270,18 +301,42 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                 "⚠️ Semantic model сейчас недоступна; показан локальный FTS fallback. "
                 f"Причина: `{result.detail}`"
             )
-        return rows, state, note
+        return rows, note
 
-    def open_result(result_state, evt: gr.SelectData):
-        if not result_state:
-            return (gr.update(), None, "", "", "", "", gr.update(), "", "")
-        index = evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index
-        try:
-            session_id = result_state[int(index)]["session_id"]
-        except (IndexError, KeyError, TypeError, ValueError):
-            return (gr.update(), None, "", "", "", "", gr.update(), "", "")
-        title, meta, conversation, resume, slider, window_note = view_session(session_id)
+    def open_result(evt: gr.SelectData):
+        row_value = evt.row_value
+        if not isinstance(row_value, (list, tuple)) or len(row_value) < 5:
+            return (
+                gr.update(),
+                gr.update(),
+                None,
+                "",
+                "",
+                "",
+                "",
+                gr.update(),
+                "",
+                "Не удалось определить выбранную строку.",
+            )
+
+        session_id = str(row_value[4])
+        snippet = str(row_value[3])
+        parsed = store.load_parsed_session(session_id)
+        first_message = (
+            _first_message_for_snippet(parsed.messages, snippet)
+            if parsed is not None
+            else None
+        )
+        title, meta, conversation, resume, slider, window_note = view_session(
+            session_id,
+            first_message,
+        )
+        if first_message is not None:
+            open_note = "Открыт чат прямо около найденного фрагмента."
+        else:
+            open_note = "Открыт найденный чат."
         return (
+            gr.Tabs(selected="chats"),
             gr.update(value=session_id),
             session_id,
             title,
@@ -290,7 +345,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
             resume,
             slider,
             window_note,
-            "Открыта найденная сессия — можешь сразу переименовать её сверху.",
+            open_note,
         )
 
     sessions, initial_choices, initial_id = choices_and_default()
@@ -309,7 +364,6 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
 
     with gr.Blocks(title="Codex Context") as demo:
         selected_session = gr.State(initial_id)
-        result_state = gr.State([])
 
         gr.Markdown(
             "# Codex Context\n"
@@ -317,9 +371,10 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
             elem_id="hero",
         )
         status = gr.Markdown(status_markdown())
+        status_timer = gr.Timer(2.0, active=True)
 
-        with gr.Tabs():
-            with gr.Tab("Чаты"):
+        with gr.Tabs(selected="chats") as main_tabs:
+            with gr.Tab("Чаты", id="chats"):
                 with gr.Row():
                     with gr.Column(scale=5):
                         session_selector = gr.Dropdown(
@@ -371,7 +426,7 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
 
                 conversation = gr.HTML(initial_conversation)
 
-            with gr.Tab("Поиск по смыслу"):
+            with gr.Tab("Поиск по смыслу", id="search"):
                 gr.Markdown(
                     "Опиши не точную фразу, а **что ты тогда делал**. "
                     "Поиск идёт локально по user/assistant сообщениям и важным tool/command фрагментам."
@@ -393,6 +448,12 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
                     label="Кликни по строке, чтобы открыть чат",
                 )
 
+        status_timer.tick(
+            status_markdown,
+            inputs=[],
+            outputs=[status],
+            show_progress="hidden",
+        )
         refresh_btn.click(
             refresh,
             inputs=[selected_session],
@@ -461,17 +522,18 @@ def create_app(settings: Settings | None = None) -> gr.Blocks:
         search_btn.click(
             do_search,
             inputs=[query, top_k],
-            outputs=[results, result_state, search_note],
+            outputs=[results, search_note],
         )
         query.submit(
             do_search,
             inputs=[query, top_k],
-            outputs=[results, result_state, search_note],
+            outputs=[results, search_note],
         )
         results.select(
             open_result,
-            inputs=[result_state],
+            inputs=None,
             outputs=[
+                main_tabs,
                 session_selector,
                 selected_session,
                 title_box,
