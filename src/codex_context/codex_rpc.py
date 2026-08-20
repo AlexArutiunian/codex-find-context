@@ -4,7 +4,6 @@ import json
 import os
 import queue
 import shutil
-import sqlite3
 import subprocess
 import threading
 import time
@@ -66,12 +65,13 @@ def _normalize_name(name: str) -> str:
 
 
 class _CodexStdioClient:
-    """Tiny synchronous JSON-RPC client for `codex app-server --listen stdio://`.
+    """Tiny synchronous JSON-RPC client for one explicit Codex metadata action.
 
-    Codex's own SDK keeps stdin open, flushes every JSON line and waits for the
-    matching response before continuing. We mirror that lifecycle here instead
-    of using subprocess.run(input=...), which closes stdin immediately and can
-    make app-server exit cleanly before responses are observed.
+    Important invariant for Codex Context: this client is never started by
+    indexing, searching, refreshing, or application startup. It is created only
+    from an explicit user rename/reset action, then terminated immediately after
+    the RPC response. Normal dashboard operation is read-only with respect to
+    CODEX_HOME.
     """
 
     def __init__(self, codex_bin: str, codex_home: Path, timeout: float):
@@ -138,8 +138,10 @@ class _CodexStdioClient:
                     continue
                 try:
                     message = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    self.messages.put(CodexRpcError(f"Некорректный JSON от Codex app-server: {line[:300]!r}"))
+                except json.JSONDecodeError:
+                    self.messages.put(
+                        CodexRpcError(f"Некорректный JSON от Codex app-server: {line[:300]!r}")
+                    )
                     continue
                 if isinstance(message, dict):
                     self.messages.put(message)
@@ -214,16 +216,13 @@ class _CodexStdioClient:
                     raise message
                 raise CodexRpcError(f"Ошибка чтения Codex app-server: {message}") from message
 
-            # App-server may ask the client an approval question. Renaming should
-            # not need one, but acknowledge unknown server requests so the RPC
-            # stream can never deadlock on an unexpected request.
+            # Renaming should not require approvals, but acknowledge unexpected
+            # server requests so the short-lived RPC cannot deadlock.
             if "method" in message and "id" in message:
                 self.send({"id": message["id"], "result": {}})
                 continue
 
             if str(message.get("id", "")) != request_id:
-                # Notification or an unrelated response; there is only one
-                # outstanding request in this tiny client, so it is safe to skip.
                 continue
             return message
 
@@ -244,10 +243,10 @@ def set_thread_names(
     updates: Iterable[tuple[str, str]],
     timeout: float = 20.0,
 ) -> dict[str, str]:
-    """Persist multiple names through one live Codex app-server process.
+    """Persist names through a short-lived Codex app-server.
 
-    Returns a mapping of thread_id -> error only for failed updates. An empty
-    mapping means every requested rename was accepted by Codex.
+    This function must only be called in direct response to an explicit user
+    rename/reset action. Search/indexing code must never call it.
     """
     normalized_updates = [(thread_id, _normalize_name(name)) for thread_id, name in updates]
     if not normalized_updates:
@@ -284,8 +283,6 @@ def set_thread_names(
                 )
             except CodexRpcError as exc:
                 failures[thread_id] = str(exc)
-                # A transport error usually means the process is gone, so later
-                # requests cannot succeed. Record the same failure for the rest.
                 for remaining_thread_id, _ in normalized_updates[index + 1 :]:
                     failures.setdefault(remaining_thread_id, str(exc))
                 break
@@ -298,55 +295,7 @@ def set_thread_names(
 
 
 def set_thread_name(codex_home: Path, thread_id: str, name: str, timeout: float = 12.0) -> None:
-    """Persist one thread name through Codex's native `thread/name/set` RPC."""
+    """Persist one native thread name after an explicit user action."""
     failures = set_thread_names(codex_home, [(thread_id, name)], timeout=timeout)
     if thread_id in failures:
         raise CodexRpcError(failures[thread_id])
-
-
-def _migrate_saved_titles() -> None:
-    """Best-effort migration for titles saved by older Codex Context versions."""
-    data_dir = Path(
-        os.getenv("CODEX_CONTEXT_DATA_DIR", "~/.local/share/codex-find-context")
-    ).expanduser()
-    db_path = data_dir / "index.sqlite3"
-    if not db_path.is_file():
-        return
-
-    try:
-        with sqlite3.connect(db_path, timeout=5) as conn:
-            rows = conn.execute(
-                """
-                SELECT session_id, custom_title
-                FROM sessions
-                WHERE custom_title IS NOT NULL AND trim(custom_title) != ''
-                ORDER BY session_id
-                """
-            ).fetchall()
-    except sqlite3.Error as exc:
-        print(f"[codex-context] saved-title migration could not read local DB: {exc}")
-        return
-
-    updates = [(str(session_id), str(title)) for session_id, title in rows]
-    if not updates:
-        return
-
-    codex_home = Path(os.getenv("CODEX_HOME", "~/.codex")).expanduser()
-    try:
-        failures = set_thread_names(codex_home, updates)
-    except CodexRpcError as exc:
-        print(f"[codex-context] saved-title migration unavailable: {exc}")
-        return
-
-    if failures:
-        print(
-            "[codex-context] saved-title migration partial failure: "
-            + "; ".join(f"{thread_id}: {error}" for thread_id, error in failures.items())
-        )
-    else:
-        print(f"[codex-context] synced {len(updates)} saved title(s) into Codex metadata")
-
-
-# Runs once per Codex Context process, in the background, so old custom titles
-# survive the transition from local-only naming to Codex-native naming.
-threading.Thread(target=_migrate_saved_titles, daemon=True).start()
